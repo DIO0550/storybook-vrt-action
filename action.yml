@@ -1,0 +1,468 @@
+name: Storybook VRT
+description: Storybook のストーリーを撮影して main のベースラインと比較し、レポートを GitHub Pages へ公開して PR にコメントする
+author: DIO0550
+branding:
+  icon: eye
+  color: blue
+
+inputs:
+  mode:
+    description: |
+      compare  ... PR のストーリーを撮影してベースラインと比較し、レポートの公開・コメント・判定まで行う(pull_request イベント用)
+      baseline ... ストーリーを撮影し、Pages 用ブランチの baseline-path へベースラインとして公開する(main への push 用)
+      capture  ... ストーリーを撮影して output-dir へ書くだけ(自前のデプロイにベースラインを同梱したいとき用)
+    default: compare
+  github-token:
+    description: PR へのコメント・ラベル操作・Pages のビルド要求に使うトークン
+    default: ${{ github.token }}
+  working-directory:
+    description: build-command を実行し、storybook-dir を解決する基準のディレクトリ(この中から git のリポジトリを探して gh-pages を読み書きする)
+    default: .
+  build-command:
+    description: 撮影前に実行する Storybook のビルドコマンド(例 `pnpm build-storybook`)。空ならビルド済みの storybook-dir をそのまま使う
+    default: ""
+  storybook-dir:
+    description: ビルド済み Storybook のディレクトリ(index.json と iframe.html があること)
+    default: storybook-static
+  output-dir:
+    description: mode が capture のとき、スクリーンショットを書くディレクトリ(working-directory からの相対)
+    default: visual-baseline
+  pages-branch:
+    description: ベースラインとレポートを置く GitHub Pages 用のブランチ
+    default: gh-pages
+  baseline-path:
+    description: pages-branch の中でベースラインを置くパス
+    default: visual-baseline
+  report-path:
+    description: pages-branch の中でレポートを置くパス。PR ごとに `<report-path>/pr-<番号>/` へ置く
+    default: visual-regression
+  pages-url:
+    description: pages-branch が配信される URL。空なら `https://<owner>.github.io/<repo>` とみなす(独自ドメインのときに指定する)
+    default: ""
+  wait-for-pages:
+    description: レポートが Pages から実際に配信されるまで待つか
+    default: "true"
+  pages-timeout-seconds:
+    description: 配信を待つ上限(秒)。待っても出ないときはビルドを 1 回要求して、もう一度同じだけ待つ
+    default: "600"
+  approval-label:
+    description: このラベルが PR に付いている間は、差分があってもチェックを通す
+    default: visual-approved
+  fail-on-diff:
+    description: 承認ラベルの無い差分があるとき、この action を失敗させるか
+    default: "true"
+  comment:
+    description: PR に結果のコメントを書くか
+    default: "true"
+  comment-title:
+    description: PR コメントの見出し。同じリポジトリで複数回使うときは見出しを変えると、別々のコメントになる
+    default: Storybook visual regression
+  storybook-url:
+    description: PR コメントに載せる Storybook プレビューの URL(任意)
+    default: ""
+  max-diff-ratio:
+    description: この割合を超えて画素が違うストーリーを Changed とする(0.002 = 0.2%)
+    default: "0.002"
+  threshold:
+    description: 1 画素を「違う」とみなす色差のしきい値(odiff の threshold。0〜1)
+    default: "0.1"
+  viewport-width:
+    description: 撮影する幅(px)
+    default: "1280"
+  viewport-height:
+    description: 撮影する高さ(px)
+    default: "720"
+  settle-ms:
+    description: ストーリーを開いてから最初に撮るまでの待ち(ms)
+    default: "750"
+  stable-poll-ms:
+    description: 描画が落ち着いたかを確かめる撮り直しの間隔(ms)
+    default: "250"
+  stable-timeout-ms:
+    description: 描画が落ち着くのを待つ上限(ms)。超えたら settle-ms 時点の絵を使う
+    default: "8000"
+  allow-overflow:
+    description: ストーリーが撮影範囲からはみ出していても撮影を失敗させない(はみ出た部分は比較されない)
+    default: "false"
+  font-packages:
+    description: 撮影前に apt で入れるフォントのパッケージ(空白区切り)。空なら入れない
+    default: fonts-noto-cjk
+  require-japanese-font:
+    description: 日本語が豆腐(□)で描画される環境なら撮影前に失敗させるか
+    default: "true"
+  node-version:
+    description: actions/setup-node で用意する Node.js のバージョン(22 以上)。空なら PATH にある node をそのまま使う
+    default: "24"
+  artifact-name:
+    description: レポートを上げる artifact の名前。空なら上げない
+    default: storybook-visual-report
+
+outputs:
+  result:
+    description: "compare の結果: passed(差分なし) / approved(差分ありだが承認済み) / changed(承認されていない差分あり) / error(撮影・比較・公開のどこかで失敗) / skipped"
+    value: ${{ steps.result.outputs.result }}
+  changed:
+    description: Changed の件数
+    value: ${{ steps.result.outputs.changed }}
+  new:
+    description: New の件数
+    value: ${{ steps.result.outputs.new }}
+  deleted:
+    description: Deleted の件数
+    value: ${{ steps.result.outputs.deleted }}
+  passed:
+    description: Passed の件数
+    value: ${{ steps.result.outputs.passed }}
+  report-url:
+    description: 公開したレポートの URL
+    value: ${{ steps.context.outputs.report-url }}
+  report-dir:
+    description: ランナー上のレポートのディレクトリ
+    value: ${{ steps.context.outputs.report-dir }}
+  screenshots-dir:
+    description: ランナー上の撮影結果のディレクトリ
+    value: ${{ steps.context.outputs.actual-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve context
+      id: context
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        EVENT_ACTION: ${{ github.event.action }}
+        EVENT_LABEL: ${{ github.event.label.name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        APPROVAL_LABEL: ${{ inputs.approval-label }}
+        PAGES_URL: ${{ inputs.pages-url }}
+        REPORT_PATH: ${{ inputs.report-path }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        case "$MODE" in
+          compare | baseline | capture) ;;
+          *) echo "::error::mode must be compare, baseline or capture (got '$MODE')"; exit 1 ;;
+        esac
+
+        # 撮影を走らせるか / 後片付けだけか / 何もしないかを先に決める。
+        run=true
+        closed=false
+        if [ "$MODE" = "compare" ]; then
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::mode: compare needs a pull_request event (got $GITHUB_EVENT_NAME)"
+            exit 1
+          fi
+          # 無関係なラベルの付け外しでは撮影からやり直さない。
+          if { [ "$EVENT_ACTION" = "labeled" ] || [ "$EVENT_ACTION" = "unlabeled" ]; } && [ "$EVENT_LABEL" != "$APPROVAL_LABEL" ]; then
+            echo "label '$EVENT_LABEL' is not the approval label; nothing to do"
+            run=false
+          fi
+          [ "$EVENT_ACTION" = "closed" ] && closed=true
+        fi
+
+        owner="${GITHUB_REPOSITORY%%/*}"
+        repo="${GITHUB_REPOSITORY#*/}"
+        owner_lower=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+        repo_lower=$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')
+        if [ -n "$PAGES_URL" ]; then
+          pages_url="${PAGES_URL%/}"
+        elif [ "$repo_lower" = "${owner_lower}.github.io" ]; then
+          pages_url="https://${owner_lower}.github.io"
+        else
+          pages_url="https://${owner_lower}.github.io/${repo}"
+        fi
+
+        work="${RUNNER_TEMP}/storybook-vrt"
+        if [ "$MODE" = "capture" ]; then
+          actual_dir="$(cd "$WORKING_DIRECTORY" && pwd)/$OUTPUT_DIR"
+        else
+          actual_dir="$work/actual"
+        fi
+        {
+          echo "run=$run"
+          echo "closed=$closed"
+          echo "capture=$([ "$run" = true ] && [ "$closed" = false ] && echo true || echo false)"
+          echo "pr-number=$PR_NUMBER"
+          echo "report-version=$HEAD_SHA"
+          echo "pages-url=$pages_url"
+          echo "work-dir=$work"
+          echo "expected-dir=$work/expected/root"
+          echo "actual-dir=$actual_dir"
+          echo "report-dir=$work/report"
+          if [ "$MODE" = "compare" ]; then
+            echo "report-url=$pages_url/$REPORT_PATH/pr-$PR_NUMBER/?revision=$HEAD_SHA"
+            echo "summary-url=$pages_url/$REPORT_PATH/pr-$PR_NUMBER/summary.json?revision=$HEAD_SHA"
+          fi
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Setup Node.js
+      if: steps.context.outputs.capture == 'true' && inputs.node-version != ''
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install action dependencies
+      if: steps.context.outputs.capture == 'true'
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        npm ci --omit=dev --no-audit --no-fund
+        node scripts/storybook-visual-regression.mjs odiff-check
+
+    # ubuntu のランナーには CJK フォントが無く、日本語が豆腐(□)で描画される。
+    # 豆腐は「差分なし」で baseline に焼き付いてしまうため、撮影前に導入する。
+    - name: Install fonts
+      if: steps.context.outputs.capture == 'true' && inputs.font-packages != ''
+      shell: bash
+      env:
+        FONT_PACKAGES: ${{ inputs.font-packages }}
+      run: |
+        sudo apt-get update
+        # shellcheck disable=SC2086 # 空白区切りの複数パッケージを渡すため
+        sudo apt-get install -y --no-install-recommends $FONT_PACKAGES
+        fc-cache -f
+
+    - name: Build Storybook
+      if: steps.context.outputs.capture == 'true' && inputs.build-command != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BUILD_COMMAND: ${{ inputs.build-command }}
+      run: eval "$BUILD_COMMAND"
+
+    - name: Fetch visual baseline
+      if: steps.context.outputs.capture == 'true' && inputs.mode == 'compare'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PAGES_BRANCH: ${{ inputs.pages-branch }}
+        BASELINE_PATH: ${{ inputs.baseline-path }}
+        EXPECTED_ROOT: ${{ steps.context.outputs.work-dir }}/expected
+      run: |
+        set -euo pipefail
+        rm -rf "$EXPECTED_ROOT"
+        mkdir -p "$EXPECTED_ROOT/root"
+        # 呼び出し側のチェックアウト(作業ツリー・index)には触れずに取り出す。
+        if git fetch --no-tags origin "+refs/heads/$PAGES_BRANCH:refs/remotes/origin/$PAGES_BRANCH" 2>/dev/null \
+          && git cat-file -e "refs/remotes/origin/$PAGES_BRANCH:$BASELINE_PATH" 2>/dev/null; then
+          mkdir -p "$EXPECTED_ROOT/archive"
+          git archive "refs/remotes/origin/$PAGES_BRANCH" -- "$BASELINE_PATH" | tar -x -C "$EXPECTED_ROOT/archive"
+          rmdir "$EXPECTED_ROOT/root"
+          mv "$EXPECTED_ROOT/archive/$BASELINE_PATH" "$EXPECTED_ROOT/root"
+          echo "baseline: $(find "$EXPECTED_ROOT/root" -name '*.png' | wc -l) screenshot(s)"
+        else
+          echo "::warning::no baseline found at $PAGES_BRANCH:$BASELINE_PATH; every story is reported as New"
+        fi
+
+    - name: Capture Storybook screenshots
+      id: capture
+      if: steps.context.outputs.capture == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SCRIPT: ${{ github.action_path }}/scripts/storybook-visual-regression.mjs
+        STORYBOOK_DIR: ${{ inputs.storybook-dir }}
+        OUT: ${{ steps.context.outputs.actual-dir }}
+        WIDTH: ${{ inputs.viewport-width }}
+        HEIGHT: ${{ inputs.viewport-height }}
+        SETTLE_MS: ${{ inputs.settle-ms }}
+        STABLE_POLL_MS: ${{ inputs.stable-poll-ms }}
+        STABLE_TIMEOUT_MS: ${{ inputs.stable-timeout-ms }}
+        ALLOW_OVERFLOW: ${{ inputs.allow-overflow }}
+        REQUIRE_JAPANESE_FONT: ${{ inputs.require-japanese-font }}
+      run: >-
+        node "$SCRIPT" capture
+        --storybook-dir "$STORYBOOK_DIR"
+        --out "$OUT"
+        --width "$WIDTH"
+        --height "$HEIGHT"
+        --settle-ms "$SETTLE_MS"
+        --stable-poll-ms "$STABLE_POLL_MS"
+        --stable-timeout-ms "$STABLE_TIMEOUT_MS"
+        --allow-overflow "$ALLOW_OVERFLOW"
+        --require-japanese-font "$REQUIRE_JAPANESE_FONT"
+
+    # ---- baseline ----
+
+    - name: Publish visual baseline
+      if: inputs.mode == 'baseline'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PAGES_BRANCH: ${{ inputs.pages-branch }}
+        TARGET_PATH: ${{ inputs.baseline-path }}
+        SOURCE_DIR: ${{ steps.context.outputs.actual-dir }}
+        COMMIT_MESSAGE: "Visual baseline @ ${{ github.sha }}"
+        WORKTREE_DIR: ${{ steps.context.outputs.work-dir }}/pages
+      run: bash "${{ github.action_path }}/scripts/publish-pages.sh"
+
+    # ---- compare ----
+
+    - name: Compare screenshots
+      id: compare
+      if: steps.context.outputs.capture == 'true' && inputs.mode == 'compare'
+      continue-on-error: true
+      shell: bash
+      env:
+        SCRIPT: ${{ github.action_path }}/scripts/storybook-visual-regression.mjs
+        EXPECTED: ${{ steps.context.outputs.expected-dir }}
+        ACTUAL: ${{ steps.context.outputs.actual-dir }}
+        OUT: ${{ steps.context.outputs.report-dir }}
+        MAX_DIFF_RATIO: ${{ inputs.max-diff-ratio }}
+        THRESHOLD: ${{ inputs.threshold }}
+        REPORT_VERSION: ${{ steps.context.outputs.report-version }}
+      run: >-
+        node "$SCRIPT" compare
+        --expected "$EXPECTED"
+        --actual "$ACTUAL"
+        --out "$OUT"
+        --max-diff-ratio "$MAX_DIFF_RATIO"
+        --threshold "$THRESHOLD"
+        --report-version "$REPORT_VERSION"
+
+    - name: Verify visual report
+      id: verify
+      if: always() && steps.context.outputs.capture == 'true' && inputs.mode == 'compare'
+      shell: bash
+      env:
+        SCRIPT: ${{ github.action_path }}/scripts/storybook-visual-regression.mjs
+        REPORT: ${{ steps.context.outputs.report-dir }}
+        REPORT_VERSION: ${{ steps.context.outputs.report-version }}
+      run: node "$SCRIPT" verify --report "$REPORT" --report-version "$REPORT_VERSION"
+
+    - name: Upload visual report
+      if: always() && steps.context.outputs.capture == 'true' && inputs.mode == 'compare' && inputs.artifact-name != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.context.outputs.report-dir }}
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Publish visual report
+      id: publish
+      if: >-
+        always() && inputs.mode == 'compare' && steps.context.outputs.run == 'true'
+        && (steps.context.outputs.closed == 'true' || steps.verify.outcome == 'success')
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PAGES_BRANCH: ${{ inputs.pages-branch }}
+        TARGET_PATH: ${{ inputs.report-path }}/pr-${{ steps.context.outputs.pr-number }}
+        SOURCE_DIR: ${{ steps.context.outputs.closed == 'true' && '' || steps.context.outputs.report-dir }}
+        REPORT_VERSION: ${{ steps.context.outputs.closed == 'true' && '' || steps.context.outputs.report-version }}
+        COMMIT_MESSAGE: "Visual regression report #${{ steps.context.outputs.pr-number }} (${{ steps.context.outputs.closed == 'true' && 'removed' || 'updated' }})"
+        WORKTREE_DIR: ${{ steps.context.outputs.work-dir }}/pages
+      run: bash "${{ github.action_path }}/scripts/publish-pages.sh"
+
+    - name: Wait for GitHub Pages
+      id: wait
+      if: >-
+        always() && steps.publish.outcome == 'success'
+        && steps.context.outputs.closed != 'true' && inputs.wait-for-pages == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SUMMARY_URL: ${{ steps.context.outputs.summary-url }}
+        REPORT_VERSION: ${{ steps.context.outputs.report-version }}
+        WAIT_SECONDS: ${{ inputs.pages-timeout-seconds }}
+      run: bash "${{ github.action_path }}/scripts/wait-for-pages.sh"
+
+    # 承認ラベルはリポジトリに実在しないと PR へ付けられない。差分が出て初めて
+    # 要るものなので、案内を出す直前にこの場で用意する(既にあれば何もしない)。
+    - name: Ensure visual approval label exists
+      if: always() && steps.context.outputs.capture == 'true' && inputs.mode == 'compare' && steps.compare.outcome == 'failure'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        APPROVAL_LABEL: ${{ inputs.approval-label }}
+      run: |
+        gh label create "$APPROVAL_LABEL" \
+          --repo "$GITHUB_REPOSITORY" \
+          --description "Storybook の視覚差分をレビュー済みとして承認する" \
+          --color BFD4F2 \
+          || echo "label already exists (or cannot be created)"
+
+    - name: Comment visual report
+      if: always() && steps.context.outputs.capture == 'true' && inputs.mode == 'compare' && inputs.comment == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ steps.context.outputs.pr-number }}
+        APPROVAL_LABEL: ${{ inputs.approval-label }}
+        SUMMARY: ${{ steps.context.outputs.report-dir }}/summary.json
+        REPORT_URL: ${{ steps.context.outputs.report-url }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        STORYBOOK_URL: ${{ inputs.storybook-url }}
+        COMMENT_MARKER: "<!-- sticky-comment: storybook-vrt-action: ${{ inputs.comment-title }} -->"
+        COMMENT_TITLE: ${{ inputs.comment-title }}
+        CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        COMPARE_OUTCOME: ${{ steps.compare.outcome }}
+        VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        WAIT_OUTCOME: ${{ steps.wait.outcome }}
+      run: bash "${{ github.action_path }}/scripts/comment.sh"
+
+    # 差分は「壊した」と「意図して変えた」の区別が付かないので、既定では落として
+    # レビューを止める。意図した変更だと確認できたら承認ラベルで通す。
+    - name: Decide result
+      id: result
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        MODE: ${{ inputs.mode }}
+        CAPTURE: ${{ steps.context.outputs.capture }}
+        PR_NUMBER: ${{ steps.context.outputs.pr-number }}
+        APPROVAL_LABEL: ${{ inputs.approval-label }}
+        FAIL_ON_DIFF: ${{ inputs.fail-on-diff }}
+        SUMMARY: ${{ steps.context.outputs.report-dir }}/summary.json
+        CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        WAIT_OUTCOME: ${{ steps.wait.outcome }}
+      run: |
+        set -euo pipefail
+        if [ "$MODE" != "compare" ] || [ "$CAPTURE" != "true" ]; then
+          echo "result=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [ "$CAPTURE_OUTCOME" != "success" ] || [ "$VERIFY_OUTCOME" != "success" ]; then
+          echo "result=error" >> "$GITHUB_OUTPUT"
+          echo "::error::screenshots could not be captured or compared (capture: $CAPTURE_OUTCOME / verify: $VERIFY_OUTCOME)"
+          exit 1
+        fi
+
+        read -r changed added deleted passed < <(node -e 'const s = require(process.argv[1]); console.log(s.changed, s.new, s.deleted, s.passed)' "$SUMMARY")
+        {
+          echo "changed=$changed"
+          echo "new=$added"
+          echo "deleted=$deleted"
+          echo "passed=$passed"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$PUBLISH_OUTCOME" != "success" ] || { [ -n "$WAIT_OUTCOME" ] && [ "$WAIT_OUTCOME" != "success" ] && [ "$WAIT_OUTCOME" != "skipped" ]; }; then
+          echo "result=error" >> "$GITHUB_OUTPUT"
+          echo "::error::the visual report could not be published (publish: $PUBLISH_OUTCOME / wait: ${WAIT_OUTCOME:-skipped})"
+          exit 1
+        fi
+
+        if [ "$changed" -eq 0 ]; then
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+          echo "no visual differences"
+          exit 0
+        fi
+        if bash "${{ github.action_path }}/scripts/has-approval-label.sh"; then
+          echo "result=approved" >> "$GITHUB_OUTPUT"
+          echo "visual differences are approved by the ${APPROVAL_LABEL} label"
+          exit 0
+        fi
+        echo "result=changed" >> "$GITHUB_OUTPUT"
+        if [ "$FAIL_ON_DIFF" = "true" ]; then
+          echo "::error::$changed story(ies) changed. If the change is intended, add the ${APPROVAL_LABEL} label to the pull request."
+          exit 1
+        fi
+        echo "::warning::$changed story(ies) changed"

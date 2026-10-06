@@ -1,0 +1,20 @@
+{
+  "name": "storybook-vrt-action",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Visual regression testing for Storybook on GitHub Actions, with reports published to GitHub Pages",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "capture": "node scripts/storybook-visual-regression.mjs capture",
+    "compare": "node scripts/storybook-visual-regression.mjs compare",
+    "verify": "node scripts/storybook-visual-regression.mjs verify",
+    "odiff-check": "node scripts/storybook-visual-regression.mjs odiff-check"
+  },
+  "dependencies": {
+    "odiff-bin": "4.5.0"
+  }
+}
